@@ -9,7 +9,7 @@ BIN_SHRT  := shrt
 BIN_BENCH := shrt-bench
 BIN_TEST  := shrt-test
 
-LIB_OBJ := $(filter-out build/main.o build/bench.o build/api_test.o build/store_test.o,$(OBJ))
+LIB_OBJ := $(filter-out build/main.o build/bench.o build/api_test.o build/store_test.o build/kv_test.o,$(OBJ))
 
 all: $(BIN_SHRT) $(BIN_BENCH) $(BIN_TEST)
 
@@ -28,7 +28,7 @@ $(BIN_SHRT): $(LIB_OBJ) build/main.o
 $(BIN_BENCH): $(LIB_OBJ) build/bench.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
 
-$(BIN_TEST): $(LIB_OBJ) build/store_test.o build/api_test.o
+$(BIN_TEST): $(LIB_OBJ) build/store_test.o build/api_test.o build/kv_test.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
 
 build:

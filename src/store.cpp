@@ -1,4 +1,5 @@
 #include "store.hpp"
+#include "store_kv.hpp"
 #include "base62.hpp"
 #include "codec.hpp"
 #include "common.hpp"
@@ -118,6 +119,25 @@ static void poll_locked(Inner& inner, Tail& tail) {
     tail.last_poll = now_ms();
 }
 
+Store Store::open_kv(const std::string& addr, int instance,
+                     size_t cache_entries, int64_t cache_ttl_ms) {
+    Store st;
+    st.kvin = KvInner::open(addr, instance, cache_entries, cache_ttl_ms);
+    return st;
+}
+
+Store Store::open_env(const std::string& dir, int instance) {
+    std::string mode = env_str("STORE", "aof");
+    if (mode == "dragonfly" || mode == "redis" || mode == "kv") {
+        std::string addr = env_str("DRAGONFLY_ADDR", "");
+        if (addr.empty()) addr = env_str("KV_ADDR", "127.0.0.1:6379");
+        size_t cache = (size_t)env_i64("CACHE", 100000);
+        int64_t ttl = env_i64("CACHE_TTL_MS", 5000);
+        return open_kv(addr, instance, cache, ttl);
+    }
+    return open(dir, instance);
+}
+
 Store Store::open(const std::string& dir, int instance) {
     auto inner = std::make_shared<Inner>();
 
@@ -209,10 +229,11 @@ Store Store::open(const std::string& dir, int instance) {
     return st;
 }
 
-int Store::instance() const { return in->instance; }
-bool Store::persistent() const { return (bool)in->aof; }
+int Store::instance() const { return kvin ? kvin->instance : in->instance; }
+bool Store::persistent() const { return kvin ? true : (bool)in->aof; }
 
 void Store::poll_tails() {
+    if (kvin) { kvin->poll_tails(); return; }
     if (!in->aof) return;
     std::lock_guard lk(in->tail_mu);
     poll_locked(*in, in->tail);
@@ -259,6 +280,7 @@ static std::string gen_code(const Inner& inner) {
 std::shared_ptr<std::string> Store::shorten(const std::string& url,
                                             const std::string* alias,
                                             int64_t ttl_ms) {
+    if (kvin) return kvin->shorten(url, alias, ttl_ms);
     Inner& inner = *in;
     std::shared_lock g(inner.gate);
     int64_t now = now_ms();
@@ -291,6 +313,7 @@ std::shared_ptr<std::string> Store::shorten(const std::string& url,
 
 std::vector<std::string> Store::shorten_many(const std::vector<std::string>& urls,
                                              int64_t ttl_ms) {
+    if (kvin) return kvin->shorten_many(urls, ttl_ms);
     Inner& inner = *in;
     std::shared_lock g(inner.gate);
     int64_t now = now_ms();
@@ -328,6 +351,7 @@ std::vector<std::string> Store::shorten_many(const std::vector<std::string>& url
 
 /// Returns the target url, or nullptr for miss/expired. Counts a hit.
 std::shared_ptr<const std::string> Store::resolve(const std::string& code) {
+    if (kvin) return kvin->resolve(code);
     Inner& inner = *in;
     auto& sh = inner.shards[shard_of(code)];
     bool found = false;
@@ -380,6 +404,7 @@ std::shared_ptr<const std::string> Store::resolve(const std::string& code) {
 }
 
 bool Store::empty() const {
+    if (kvin) return kvin->empty();
     for (auto& sh : in->shards) {
         std::shared_lock lk(sh.mu);
         if (!sh.data.empty()) return false;
@@ -389,6 +414,7 @@ bool Store::empty() const {
 
 MutResult Store::update(const std::string& code, const std::string& url,
                         int64_t ttl_ms, bool has_ttl) {
+    if (kvin) return kvin->update(code, url, ttl_ms, has_ttl);
     Inner& inner = *in;
     std::shared_lock g(inner.gate);
     auto& sh = inner.shards[shard_of(code)];
@@ -411,6 +437,7 @@ MutResult Store::update(const std::string& code, const std::string& url,
 }
 
 MutResult Store::remove(const std::string& code) {
+    if (kvin) return kvin->remove(code);
     Inner& inner = *in;
     std::shared_lock g(inner.gate);
     auto& sh = inner.shards[shard_of(code)];
@@ -432,6 +459,7 @@ MutResult Store::remove(const std::string& code) {
 std::pair<std::vector<Link>, size_t> Store::list(size_t limit, size_t offset,
                                                const std::string& sort,
                                                const std::string& q) {
+    if (kvin) return kvin->list(limit, offset, sort, q);
     std::vector<Link> items;
     for (auto& sh : in->shards) {
         std::shared_lock lk(sh.mu);
@@ -456,6 +484,7 @@ std::pair<std::vector<Link>, size_t> Store::list(size_t limit, size_t offset,
 }
 
 std::unique_ptr<Link> Store::stats(const std::string& code) {
+    if (kvin) return kvin->stats(code);
     auto& sh = in->shards[shard_of(code)];
     std::shared_lock lk(sh.mu);
     auto it = sh.data.find(code);
@@ -466,12 +495,16 @@ std::unique_ptr<Link> Store::stats(const std::string& code) {
 }
 
 size_t Store::seed(const std::vector<std::string>& urls) {
+    if (kvin) return kvin->seed(urls);
     shorten_many(urls, 0);
     flush();
     return urls.size();
 }
 
-void Store::flush() { in->flush_public(); }
+void Store::flush() {
+    if (kvin) { kvin->flush(); return; }
+    in->flush_public();
+}
 
 void Inner::flush_public() {
     std::shared_lock g(gate);
@@ -505,6 +538,7 @@ void Inner::poll_tails_pub() {
 
 /// Rewrite own rows as a compact snapshot, then truncate own log.
 void Store::compact() {
+    if (kvin) { kvin->compact(); return; }
     Inner& inner = *in;
     if (!inner.aof) return;
     std::unique_lock g(inner.gate);
@@ -534,6 +568,7 @@ void Store::compact() {
 
 /// Stop timers, flush, fsync, and release the instance lock.
 void Store::close() {
+    if (kvin) { kvin.reset(); return; }
     if (!in) return;
     Inner& inner = *in;
     if (inner.closed.exchange(true, std::memory_order_relaxed)) return;

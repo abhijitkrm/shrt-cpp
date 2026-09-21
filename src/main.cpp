@@ -39,7 +39,7 @@ static std::string data_dir() { return env_str("DATA_DIR", "data"); }
 /// Bulk-insert N links if the store is empty (through the write path).
 static void seed(int64_t n) {
     try {
-        Store s = Store::open(data_dir(), 0);
+        Store s = Store::open_env(data_dir(), 0);
         if (s.empty()) {
             std::vector<std::string> urls;
             urls.reserve((size_t)n);
@@ -111,7 +111,7 @@ static int serve() {
     int64_t inst = env_i64("INSTANCE", -1);
     Store st;
     try {
-        st = Store::open(data_dir(), (int)inst);
+        st = Store::open_env(data_dir(), (int)inst);
     } catch (const std::exception& e) {
         fprintf(stderr, "%s\n", e.what());
         return 1;
