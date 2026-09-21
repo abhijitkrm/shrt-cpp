@@ -1,0 +1,9 @@
+build/
+data/
+*.log
+*.snap
+*.o
+.DS_Store
+shrt
+shrt-bench
+shrt-test
