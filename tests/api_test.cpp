@@ -1,5 +1,6 @@
 // API suite — runs against both HTTP frontends (mini + kq).
 #include "../src/app.hpp"
+#include "../src/ratelimit.hpp"
 #include "../src/common.hpp"
 #include "../src/server.hpp"
 #include "../src/store.hpp"
@@ -313,6 +314,12 @@ TEST(admin_mutations) {
         Resp r = req(port, "DELETE", "/api/links/" + code);
         CHECK_EQ(r.status, 404);
 
+        // empty ADMIN_TOKEN must also fail closed
+        setenv("ADMIN_TOKEN", "", 1);
+        Resp r0 = req(port, "DELETE", "/api/links/" + code,
+                      {{"x-admin-token", ""}});
+        CHECK_EQ(r0.status, 404);
+
         setenv("ADMIN_TOKEN", "secret", 1);
         Resp r2 = req(port, "DELETE", "/api/links/" + code,
                       {{"x-admin-token", "wrong"}});
@@ -358,4 +365,41 @@ TEST(delete_removes_and_frees_alias) {
         CHECK_EQ(reuse.status, 201);
         unsetenv("ADMIN_TOKEN");
     });
+}
+
+TEST(prometheus_metrics) {
+    run_suite([](int port) {
+        shorten(port, "https://prom.example");
+        Resp r = get(port, "/metrics");
+        CHECK_EQ(r.status, 200);
+        CHECK_EQ(r.header("content-type"), "text/plain; version=0.0.4");
+        CHECK(contains(r.body, "# TYPE shrt_requests_total counter"));
+        CHECK(contains(r.body, "shrt_requests_total{op=\"shorten\"}"));
+        CHECK(contains(r.body, "shrt_links_total"));
+        CHECK(contains(r.body, "shrt_uptime_seconds"));
+        CHECK(contains(r.body, "shrt_rate_limited_total"));
+    });
+}
+
+TEST(rate_limit_per_ip) {
+    setenv("RATE_LIMIT", "1", 1);
+    setenv("RATE_LIMIT_BURST", "4", 1);
+    RateLimiter::global().reload_for_test();
+    run_suite([](int port) {
+        // run_suite drives mini+kq off one bucket — post until rejected,
+        // assert it happens within burst+slack
+        int oks = 0, last = 0;
+        for (int i = 0; i < 10; i++) {
+            last = post(port, "/api/shorten",
+                        "{\"url\":\"https://rl.example\"}").status;
+            if (last == 201) { oks++; continue; }
+            break;
+        }
+        CHECK_EQ(last, 429);
+        CHECK(oks <= 4);
+        CHECK_EQ(get(port, "/nope").status, 404); // reads not limited
+    });
+    unsetenv("RATE_LIMIT");
+    unsetenv("RATE_LIMIT_BURST");
+    RateLimiter::global().reload_for_test();
 }

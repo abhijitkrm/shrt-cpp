@@ -47,8 +47,9 @@ SERVER=kq ./shrt    # kqueue evented frontend
 | `/:code` | GET | 302 redirect (counts a hit) |
 | `/api/stats/:code` | GET | `{"code","url","hits","created_at","expires_at"}` |
 | `/api/links` | GET | `?limit&offset&sort=hits|created&q` (admin list) |
-| `/api/links/:code` | PATCH/DELETE | requires `ADMIN_TOKEN` + `x-admin-token` header |
-| `/api/health` `/api/metrics` | GET | health / request counters |
+| `/api/links/:code` | PATCH/DELETE | requires `ADMIN_TOKEN` + `x-admin-token` header (unset/empty = always 404, fail-closed) |
+| `/api/health` | GET | 200 only when the store answers (RESP `PING` / rocksdb probe) — else 503 |
+| `/api/metrics` `/metrics` | GET | JSON counters / Prometheus text exposition |
 | `/` | GET | built-in UI (`ui/index.html`) |
 
 ## Config (env)
@@ -63,6 +64,10 @@ SERVER=kq ./shrt    # kqueue evented frontend
 value check + janitor `KV_SWEEP_MS` (1h). Needs server
 `hash-max-listpack-value` >= value size (~256) for full savings
 · `SEED` (pre-generate N links at boot) · `ADMIN_TOKEN` · `CORS_ORIGIN` (`*`)
+· `RATE_LIMIT` (0=off) — per-IP token bucket req/s on `POST /api/shorten`
+  (cost 1) and `/api/shorten/bulk` (cost = url count); 429 when empty.
+  `RATE_LIMIT_BURST` (default = RATE_LIMIT) sets capacity; `TRUST_PROXY`
+  switches the key to the first `X-Forwarded-For` address
 · `LINK_TTL_MS` (86400000, capped at this value)
 
 `STORE=dragonfly` moves the whole corpus to an external RESP store

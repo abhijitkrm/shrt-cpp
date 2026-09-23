@@ -89,6 +89,8 @@ public:
     std::unique_ptr<Link> stats(const std::string& code);
     size_t seed(const std::vector<std::string>& urls);
     bool empty() const;
+    /// /api/health probe — RESP PING / rocksdb point read / true for aof.
+    bool healthy();
 
     void flush();
     void poll_tails();

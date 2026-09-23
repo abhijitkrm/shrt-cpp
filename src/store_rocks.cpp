@@ -11,6 +11,8 @@
 // Embedded means single-writer: RocksDB holds an exclusive LOCK on the
 // DB dir, so exactly one process may open a given ROCKSDB_PATH.
 #include "store_rocks.hpp"
+#include "metrics.hpp"
+#include <chrono>
 #include "common.hpp"
 #include "base62.hpp"
 
@@ -35,15 +37,18 @@ namespace shrt {
 
 static constexpr int KV_SHARDS = 256;
 
-// ---- value codec: "{e}|{c}|{u}" (legacy "{e}|{u}" decodes with c=0) ----
+// ---- value codec: "v1|{e}|{c}|{u}" (legacy "{e}|{c}|{u}"/"{e}|{u}" decode
+// with c=0) ----
 static std::string enc(int64_t e, int64_t c, const std::string& u) {
-    return std::to_string(e) + "|" + std::to_string(c) + "|" + u;
+    return "v1|" + std::to_string(e) + "|" + std::to_string(c) + "|" + u;
 }
 static bool dec(const std::string& v, int64_t& e, int64_t& c, std::string_view& u) {
-    size_t p = v.find('|');
-    if (p == std::string::npos) return false;
-    try { e = std::stoll(v.substr(0, p)); } catch (...) { return false; }
-    std::string_view rest = std::string_view(v).substr(p + 1);
+    std::string_view sv = v;
+    if (sv.starts_with("v1|")) sv = sv.substr(3);
+    size_t p = sv.find('|');
+    if (p == std::string_view::npos) return false;
+    try { e = std::stoll(std::string(sv.substr(0, p))); } catch (...) { return false; }
+    std::string_view rest = sv.substr(p + 1);
     size_t q = rest.find('|');
     if (q != std::string_view::npos) {
         try { c = std::stoll(std::string(rest.substr(0, q))); }
@@ -210,6 +215,13 @@ struct RocksInnerImpl {
         dirty[i][code]++;
     }
 
+    /// /api/health probe: a point read proves the DB is open & readable.
+    bool healthy() {
+        std::string v;
+        rocksdb::Status s = db->Get(rocksdb::ReadOptions(), "\x00health", &v);
+        return s.ok() || s.IsNotFound();
+    }
+
     bool cache_get(const std::string& code, std::shared_ptr<const std::string>& u) {
         KvShard& sh = cache[shard(code)];
         std::lock_guard<std::mutex> g(sh.mu);
@@ -268,11 +280,18 @@ struct RocksInnerImpl {
     std::shared_ptr<const std::string> resolve(const std::string& code) {
         std::shared_ptr<const std::string> u;
         if (cache_get(code, u)) {
+            metrics::cache_hit();
             bump(code);
             return u;
         }
+        metrics::cache_miss();
+        auto t0 = std::chrono::steady_clock::now();
         std::string v;
-        if (!db_get(code, v)) return nullptr;
+        bool got = db_get(code, v);
+        metrics::store_read(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count());
+        if (!got) return nullptr;
         int64_t e, c;
         std::string_view us;
         if (!dec(v, e, c, us) || (e != 0 && e <= now_ms())) return nullptr;
@@ -284,6 +303,7 @@ struct RocksInnerImpl {
 
     std::shared_ptr<std::string> shorten(const std::string& url,
                                          const std::string* alias, int64_t ttl_ms) {
+        metrics::store_write();
         int64_t now = now_ms();
         int64_t exp = ttl_ms > 0 ? now + ttl_ms : 0;
         if (alias) {
@@ -434,6 +454,8 @@ RocksInner::RocksInner(const std::string& path, int inst, size_t ce, int64_t ct)
     instance = p->instance;
 }
 RocksInner::~RocksInner() = default;
+
+bool RocksInner::healthy() { return p->healthy(); }
 
 std::shared_ptr<RocksInner> RocksInner::open(const std::string& path, int inst,
                                              size_t ce, int64_t ct) {

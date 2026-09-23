@@ -58,6 +58,8 @@ static const char* status_line(int status) {
     case 404: return "HTTP/1.1 404 Not Found\r\n";
     case 409: return "HTTP/1.1 409 Conflict\r\n";
     case 413: return "HTTP/1.1 413 Payload Too Large\r\n";
+    case 429: return "HTTP/1.1 429 Too Many Requests\r\n";
+    case 503: return "HTTP/1.1 503 Service Unavailable\r\n";
     default:  return "HTTP/1.1 500 Internal Server Error\r\n";
     }
 }
@@ -94,10 +96,39 @@ static void write_reply(std::string& out, const Reply& r) {
 
 struct ReqInfo {
     size_t total = 0;        // bytes consumed (head+body), 0 = incomplete
-    std::string_view method, path, admin;
+    std::string_view method, path, admin, xff;
     size_t body_off = 0, body_len = 0;
     bool alive = true;
 };
+
+/// Remote IP of a connected socket ("" on failure).
+static std::string peer_ip(int fd) {
+    sockaddr_storage ss{};
+    socklen_t sl = sizeof ss;
+    if (::getpeername(fd, (sockaddr*)&ss, &sl) < 0) return {};
+    char buf[INET6_ADDRSTRLEN]{};
+    if (ss.ss_family == AF_INET)
+        ::inet_ntop(AF_INET, &((sockaddr_in*)&ss)->sin_addr, buf, sizeof buf);
+    else if (ss.ss_family == AF_INET6)
+        ::inet_ntop(AF_INET6, &((sockaddr_in6*)&ss)->sin6_addr, buf, sizeof buf);
+    return buf;
+}
+
+static bool trust_proxy() {
+    static const bool v = getenv("TRUST_PROXY") != nullptr;
+    return v;
+}
+
+/// Rate-limit key: first X-Forwarded-For hop under TRUST_PROXY, else peer.
+static std::string client_ip(const ReqInfo& ri, const std::string& peer) {
+    if (trust_proxy() && !ri.xff.empty()) {
+        auto first = ri.xff.substr(0, ri.xff.find(','));
+        while (!first.empty() && first.front() == ' ') first.remove_prefix(1);
+        while (!first.empty() && first.back() == ' ') first.remove_suffix(1);
+        if (!first.empty()) return std::string(first);
+    }
+    return peer;
+}
 
 /// Parse one request from buf[pos..]; fills ReqInfo. total==0 when incomplete.
 static ReqInfo parse_req(std::string_view buf, size_t pos) {
@@ -137,6 +168,8 @@ static ReqInfo parse_req(std::string_view buf, size_t pos) {
             ri.alive = !(v == "close" || v == "Close");
         else if (k.size() == 13 && (k == "x-admin-token" || k == "X-Admin-Token"))
             ri.admin = v;
+        else if (k.size() == 15 && (k == "x-forwarded-for" || k == "X-Forwarded-For"))
+            ri.xff = v;
     }
     bool needs_body = ri.method == "POST" || ri.method == "PATCH";
     ri.body_off = pos + he + 4;
@@ -156,6 +189,7 @@ static size_t body_limit(std::string_view path) {
 // ---------- mini: thread-per-connection ----------
 
 static void conn_loop(int fd, Store* st) {
+    const std::string peer = peer_ip(fd);
     int on = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
     std::string buf, out;
@@ -191,7 +225,7 @@ static void conn_loop(int fd, Store* st) {
             std::string body = needs_body
                 ? std::string(buf.substr(ri.body_off, ri.body_len)) : std::string();
             Reply r = handle(*st, std::string(ri.method), std::string(ri.path),
-                             body, std::string(ri.admin));
+                             body, std::string(ri.admin), client_ip(ri, peer));
             write_reply(out, r);
             parsed += ri.total;
             if (!ri.alive) { close_after = true; break; }
@@ -227,6 +261,7 @@ int serve_mini(int listen_fd, Store& st) {
 
 struct KqConn {
     std::string rbuf, wbuf;
+    std::string peer; // accepted peer IP — the rate-limit key
     size_t parsed = 0;
     bool close_after = false;
     bool want_write = false;
@@ -261,6 +296,7 @@ int serve_kq(int listen_fd, Store& st) {
                     ::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
                     ::fcntl(c, F_SETFL, O_NONBLOCK);
                     conns[c] = KqConn{};
+                    conns[c].peer = peer_ip(c);
                     conns[c].rbuf.reserve(READ_CAP);
                     conns[c].wbuf.reserve(READ_CAP);
                     add_ev(c, EVFILT_READ, EV_ADD | EV_ENABLE);
@@ -296,7 +332,8 @@ int serve_kq(int listen_fd, Store& st) {
                     std::string body = needs_body
                         ? std::string(cn.rbuf.substr(ri.body_off, ri.body_len)) : std::string();
                     Reply r = handle(st, std::string(ri.method), std::string(ri.path),
-                                     body, std::string(ri.admin));
+                                     body, std::string(ri.admin),
+                                     client_ip(ri, cn.peer));
                     write_reply(cn.wbuf, r);
                     cn.parsed += ri.total;
                     if (!ri.alive) { cn.close_after = true; break; }

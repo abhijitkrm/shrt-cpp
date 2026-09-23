@@ -1,4 +1,5 @@
 #include "store.hpp"
+#include "metrics.hpp"
 #include "store_rocks.hpp"
 #include "store_kv.hpp"
 #include "base62.hpp"
@@ -296,8 +297,16 @@ static std::string gen_code(const Inner& inner) {
 std::shared_ptr<std::string> Store::shorten(const std::string& url,
                                             const std::string* alias,
                                             int64_t ttl_ms) {
-    if (kvin) return kvin->shorten(url, alias, ttl_ms);
-    if (rkin) return rkin->shorten(url, alias, ttl_ms);
+    if (kvin) {
+        auto r = kvin->shorten(url, alias, ttl_ms);
+        if (r) metrics::links_delta(1);
+        return r;
+    }
+    if (rkin) {
+        auto r = rkin->shorten(url, alias, ttl_ms);
+        if (r) metrics::links_delta(1);
+        return r;
+    }
     Inner& inner = *in;
     std::shared_lock g(inner.gate);
     int64_t now = now_ms();
@@ -325,13 +334,22 @@ std::shared_ptr<std::string> Store::shorten(const std::string& url,
         inner.aof->push(row_line(code, url, now, exp, inner.instance, 0));
         if (inner.aof->pending_bytes() > FLUSH_BYTES) inner.aof->flush();
     }
+    metrics::links_delta(1);
     return std::make_shared<std::string>(std::move(code));
 }
 
 std::vector<std::string> Store::shorten_many(const std::vector<std::string>& urls,
                                              int64_t ttl_ms) {
-    if (kvin) return kvin->shorten_many(urls, ttl_ms);
-    if (rkin) return rkin->shorten_many(urls, ttl_ms);
+    if (kvin) {
+        auto r = kvin->shorten_many(urls, ttl_ms);
+        metrics::links_delta((int64_t)r.size());
+        return r;
+    }
+    if (rkin) {
+        auto r = rkin->shorten_many(urls, ttl_ms);
+        metrics::links_delta((int64_t)r.size());
+        return r;
+    }
     Inner& inner = *in;
     std::shared_lock g(inner.gate);
     int64_t now = now_ms();
@@ -364,6 +382,7 @@ std::vector<std::string> Store::shorten_many(const std::vector<std::string>& url
         inner.aof->push_raw(lines);
         if (inner.aof->pending_bytes() > FLUSH_BYTES) inner.aof->flush();
     }
+    metrics::links_delta((int64_t)codes.size());
     return codes;
 }
 
@@ -422,6 +441,12 @@ std::shared_ptr<const std::string> Store::resolve(const std::string& code) {
     return url;
 }
 
+bool Store::healthy() {
+    if (kvin) return kvin->healthy();
+    if (rkin) return rkin->healthy();
+    return true; // the in-process engine is healthy when the process is
+}
+
 bool Store::empty() const {
     if (kvin) return kvin->empty();
     if (rkin) return rkin->empty();
@@ -458,8 +483,16 @@ MutResult Store::update(const std::string& code, const std::string& url,
 }
 
 MutResult Store::remove(const std::string& code) {
-    if (kvin) return kvin->remove(code);
-    if (rkin) return rkin->remove(code);
+    if (kvin) {
+        auto r = kvin->remove(code);
+        if (r == MutResult::Ok) metrics::links_delta(-1);
+        return r;
+    }
+    if (rkin) {
+        auto r = rkin->remove(code);
+        if (r == MutResult::Ok) metrics::links_delta(-1);
+        return r;
+    }
     Inner& inner = *in;
     std::shared_lock g(inner.gate);
     auto& sh = inner.shards[shard_of(code)];
@@ -474,6 +507,7 @@ MutResult Store::remove(const std::string& code) {
         std::lock_guard lk(inner.aof_mu);
         inner.aof->push(del_line(code));
     }
+    metrics::links_delta(-1);
     return MutResult::Ok;
 }
 

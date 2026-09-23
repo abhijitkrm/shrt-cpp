@@ -3,6 +3,10 @@
 #include "../src/store.hpp"
 #include "test.hpp"
 
+#include <rocksdb/db.h>
+#include <cstdlib>
+#include <memory>
+
 #include <chrono>
 #include <cstdio>
 #include <set>
@@ -257,3 +261,53 @@ TEST(compact_preserves_rows_and_truncates) {
 }
 
 int main() { return tst::run(); }
+
+TEST(rocks_legacy_value_decode) {
+    const char* dir = "/tmp/shrt-legacy-rocks";
+    system(("rm -rf " + std::string(dir)).c_str());
+    // write a pre-version "{e}|{c}|{u}" row straight into rocksdb
+    {
+        std::unique_ptr<rocksdb::DB> d;
+        rocksdb::Options o;
+        o.create_if_missing = true;
+        rocksdb::Status st = rocksdb::DB::Open(o, dir, &d);
+        CHECK(st.ok());
+        rocksdb::ColumnFamilyHandle* links = nullptr;
+        rocksdb::ColumnFamilyHandle* hits = nullptr;
+        st = d->CreateColumnFamily(rocksdb::ColumnFamilyOptions(), "links", &links);
+        CHECK(st.ok());
+        st = d->CreateColumnFamily(rocksdb::ColumnFamilyOptions(), "hits", &hits);
+        CHECK(st.ok());
+        st = d->Put(rocksdb::WriteOptions(), links, "legacyR",
+                    "0|0|https://rocks-legacy.example");
+        CHECK(st.ok());
+        d->DestroyColumnFamilyHandle(links);
+        d->DestroyColumnFamilyHandle(hits);
+    }
+    auto s = Store::open_rocks(dir, 0, 16, 5000);
+    auto u = s.resolve("legacyR");
+    CHECK(u && *u == "https://rocks-legacy.example");
+    // new writes are v1-tagged
+    auto c = s.shorten("https://v1rocks.example", nullptr, 0);
+    CHECK(c);
+    s.close();
+    {
+        std::unique_ptr<rocksdb::DB> d;
+        rocksdb::DBOptions dbo;
+        std::vector<rocksdb::ColumnFamilyDescriptor> desc{
+            {rocksdb::kDefaultColumnFamilyName, rocksdb::ColumnFamilyOptions()},
+            {"links", rocksdb::ColumnFamilyOptions()},
+            {"hits", rocksdb::ColumnFamilyOptions()}};
+        std::vector<rocksdb::ColumnFamilyHandle*> hs;
+        rocksdb::Status st = rocksdb::DB::Open(dbo, dir, desc, &hs, &d);
+        CHECK(st.ok());
+        rocksdb::ColumnFamilyHandle* links = nullptr;
+        for (auto* h : hs) if (h->GetName() == "links") links = h;
+        CHECK(links);
+        std::string v;
+        st = d->Get(rocksdb::ReadOptions(), links, *c, &v);
+        CHECK(st.ok());
+        CHECK(v.rfind("v1|", 0) == 0);
+        for (auto* h : hs) d->DestroyColumnFamilyHandle(h);
+    }
+}

@@ -23,6 +23,7 @@ struct Reply {
 /// Transport-agnostic request handler. `path` includes the query string;
 /// `body` is the raw request body (empty when absent).
 Reply handle(Store& st, const std::string& method, const std::string& path,
-             const std::string& body, const std::string& admin_token);
+             const std::string& body, const std::string& admin_token,
+             const std::string& client);
 
 } // namespace shrt

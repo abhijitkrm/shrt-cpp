@@ -128,3 +128,30 @@ TEST(kv_cache_bounded) {
     for (auto& c : codes)
         CHECK(s.resolve(c));
 }
+
+TEST(kv_legacy_value_decode) {
+    // raw-row injection only matches KV_LAYOUT=key; hash layout wraps the
+    // same dec() but rows live as hash fields — covered by Rust/Go ports.
+    const char* lay = getenv("KV_LAYOUT");
+    if (lay && std::string(lay) == "hash") {
+        printf("  skip %s: KV_LAYOUT=hash\n", __func__);
+        return;
+    }
+    KV_GUARD(s);
+    // inject pre-version rows directly: "{e}|{c}|{u}" and "{e}|{u}"
+    { const char* a = getenv("SHRT_KV_ADDR");
+      Kv k(a, 1);
+      k.set("l:legacy2", "0|0|https://two.example", 0, false);
+      k.set("l:legacy1", "0|https://one.example", 0, false); }
+    auto u1 = s.resolve("legacy1");
+    CHECK(u1 && *u1 == "https://one.example");
+    auto u2 = s.resolve("legacy2");
+    CHECK(u2 && *u2 == "https://two.example");
+    // new writes carry the v1 tag
+    std::string a = "v1check";
+    s.shorten("https://v1.example", &a, 0);
+    { const char* ad = getenv("SHRT_KV_ADDR");
+      Kv k(ad, 1);
+      auto raw = k.get("l:v1check");
+      CHECK(raw && raw->rfind("v1|", 0) == 0); }
+}

@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "ratelimit.hpp"
 #include "common.hpp"
 #include "metrics.hpp"
 
@@ -313,8 +314,21 @@ static std::unordered_map<std::string, std::string> parse_query(const std::strin
 
 // ---------- handler ----------
 
+static Reply route(Store& st, const std::string& method, const std::string& path,
+                   const std::string& body, const std::string& admin_token,
+                   const std::string& client);
+
 Reply handle(Store& st, const std::string& method, const std::string& path,
-             const std::string& body, const std::string& admin_token) {
+             const std::string& body, const std::string& admin_token,
+             const std::string& client) {
+    Reply r = route(st, method, path, body, admin_token, client);
+    metrics::status(r.status);
+    return r;
+}
+
+static Reply route(Store& st, const std::string& method, const std::string& path,
+                   const std::string& body, const std::string& admin_token,
+                   const std::string& client) {
     size_t qi = path.find('?');
     std::string pathname = path.substr(0, qi);
     std::string query = qi == std::string::npos ? "" : path.substr(qi + 1);
@@ -324,14 +338,30 @@ Reply handle(Store& st, const std::string& method, const std::string& path,
     if (method == "OPTIONS") return Reply{204, nullptr, {}, nullptr};
 
     if (method == "GET") {
-        if (pathname == "/api/health") return mk(200, "{\"ok\":true}");
-        if (pathname == "/api/metrics") return mk(200, metrics::snapshot());
+        if (pathname == "/api/health") {
+            metrics::op(metrics::OP_HEALTH);
+            return st.healthy() ? mk(200, "{\"ok\":true}")
+                                : mk(503, "{\"ok\":false}");
+        }
+        if (pathname == "/api/metrics") {
+            metrics::op(metrics::OP_METRICS);
+            return mk(200, metrics::snapshot());
+        }
+        if (pathname == "/metrics") {
+            metrics::op(metrics::OP_METRICS);
+            Reply r{200, nullptr,
+                    metrics::prometheus(rate_limited.load(std::memory_order_relaxed)),
+                    "text/plain; version=0.0.4"};
+            return r;
+        }
         if (pathname == "/") {
+            metrics::op(metrics::OP_UI);
             const std::string& html = ui_html();
             if (html.empty()) return not_found();
             return Reply{200, nullptr, html, "text/html; charset=utf-8"};
         }
         if (pathname == "/api/links") {
+            metrics::op(metrics::OP_LIST);
             auto p = parse_query(query);
             int64_t limit = 50;
             if (auto it = p.find("limit"); it != p.end()) {
@@ -360,6 +390,7 @@ Reply handle(Store& st, const std::string& method, const std::string& path,
             return mk(200, std::move(b));
         }
         if (pathname.rfind("/api/stats/", 0) == 0) {
+            metrics::op(metrics::OP_STATS);
             auto link = st.stats(pathname.substr(11));
             if (!link) return not_found();
             std::string b;
@@ -367,17 +398,33 @@ Reply handle(Store& st, const std::string& method, const std::string& path,
             return mk(200, std::move(b));
         }
         std::string code = pathname.substr(1);
-        if (code_ok(code))
+        if (code_ok(code)) {
+            metrics::op(metrics::OP_REDIRECT);
             if (auto target = st.resolve(code))
                 return Reply{302, target, {}, nullptr};
+        }
         return not_found();
     }
 
     if (method == "POST") {
-        if (pathname != "/api/shorten" && pathname != "/api/shorten/bulk")
+        if (pathname != "/api/shorten" && pathname != "/api/shorten/bulk") {
+            metrics::op(metrics::OP_OTHER);
             return not_found();
+        }
         J p;
         if (!jparse(body, p)) return bad("invalid json");
+        double cost = 1;
+        if (pathname == "/api/shorten/bulk") {
+            if (const J* u = p.find("urls"); u && u->t == J::ARR)
+                cost = std::max(1.0, (double)u->arr.size());
+        }
+        if (!RateLimiter::global().allow(client, cost)) {
+            rate_limited.fetch_add(1, std::memory_order_relaxed);
+            metrics::op(metrics::OP_OTHER);
+            return mk(429, "{\"error\":\"rate limited\"}");
+        }
+        metrics::op(pathname == "/api/shorten" ? metrics::OP_SHORTEN
+                                             : metrics::OP_BULK);
         return pathname == "/api/shorten" ? shorten_one(st, p) : shorten_bulk(st, p);
     }
 
@@ -387,6 +434,7 @@ Reply handle(Store& st, const std::string& method, const std::string& path,
         std::string code = pathname.substr(11);
         if (!code_ok(code)) return bad("invalid code");
         if (method == "DELETE") {
+            metrics::op(metrics::OP_DELETE);
             switch (st.remove(code)) {
             case MutResult::Ok: return Reply{204, nullptr, {}, nullptr};
             case MutResult::Missing: return not_found();
@@ -406,6 +454,7 @@ Reply handle(Store& st, const std::string& method, const std::string& path,
                     has_ttl = true;
                 }
             }
+            metrics::op(metrics::OP_UPDATE);
             switch (st.update(code, u->str, ttl, has_ttl)) {
             case MutResult::Ok: return mk(200, "{\"ok\":true}");
             case MutResult::Missing: return not_found();

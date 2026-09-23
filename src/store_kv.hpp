@@ -34,6 +34,7 @@ struct KvInner {
     std::unique_ptr<Link> stats(const std::string& code);
     size_t seed(const std::vector<std::string>& urls);
     bool empty();
+    bool healthy();
     void flush();
     void poll_tails();
     void compact();

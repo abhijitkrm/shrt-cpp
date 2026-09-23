@@ -11,6 +11,8 @@
 
 #include "store_kv.hpp"
 #include "kv.hpp"
+#include "metrics.hpp"
+#include <chrono>
 #include "common.hpp"
 #include "base62.hpp"
 #include <algorithm>
@@ -107,15 +109,17 @@ struct KvInnerImpl {
     }
     static std::string hfield(const std::string& c) { return "h:" + c; }
 
-    // "{e}|{c}|{u}" — legacy "{e}|{u}" decodes with c=0
+    // "v1|{e}|{c}|{u}" — legacy "{e}|{c}|{u}" and "{e}|{u}" decode with c=0
     static std::string enc(int64_t e, int64_t c, const std::string& u) {
-        return std::to_string(e) + "|" + std::to_string(c) + "|" + u;
+        return "v1|" + std::to_string(e) + "|" + std::to_string(c) + "|" + u;
     }
     static bool dec(const std::string& v, int64_t& e, int64_t& c, std::string_view& u) {
-        size_t p = v.find('|');
-        if (p == std::string::npos) return false;
-        try { e = std::stoll(v.substr(0, p)); } catch (...) { return false; }
-        std::string_view rest = std::string_view(v).substr(p + 1);
+        std::string_view sv = v;
+        if (sv.starts_with("v1|")) sv = sv.substr(3);
+        size_t p = sv.find('|');
+        if (p == std::string_view::npos) return false;
+        try { e = std::stoll(std::string(sv.substr(0, p))); } catch (...) { return false; }
+        std::string_view rest = sv.substr(p + 1);
         size_t q = rest.find('|');
         if (q != std::string_view::npos) {
             try { c = std::stoll(std::string(rest.substr(0, q))); }
@@ -181,6 +185,16 @@ struct KvInnerImpl {
         dirty[i][code]++;
     }
 
+    /// /api/health probe: RESP PING round-trip.
+    bool healthy() {
+        try {
+            Resp r = kv.cmd({"PING"});
+            return r.kind == '+' && r.str == "PONG";
+        } catch (...) {
+            return false;
+        }
+    }
+
     bool cache_get(const std::string& code, std::shared_ptr<const std::string>& u) {
         KvShard& sh = cache[shard(code)];
         std::lock_guard<std::mutex> g(sh.mu);
@@ -229,10 +243,16 @@ struct KvInnerImpl {
     std::shared_ptr<const std::string> resolve(const std::string& code) {
         std::shared_ptr<const std::string> u;
         if (cache_get(code, u)) {
+            metrics::cache_hit();
             bump(code);
             return u;
         }
+        metrics::cache_miss();
+        auto t0 = std::chrono::steady_clock::now();
         auto v = kv_get(code);
+        metrics::store_read(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count());
         if (!v) return nullptr;
         int64_t e, c;
         std::string_view us;
@@ -245,6 +265,7 @@ struct KvInnerImpl {
 
     std::shared_ptr<std::string> shorten(const std::string& url,
                                          const std::string* alias, int64_t ttl_ms) {
+        metrics::store_write();
         int64_t now = now_ms();
         int64_t exp = ttl_ms > 0 ? now + ttl_ms : 0;
         if (alias) {
@@ -463,6 +484,8 @@ KvInner::KvInner(const std::string& addr, int inst, size_t cache_entries,
       instance(p->instance) {}
 
 KvInner::~KvInner() = default;
+
+bool KvInner::healthy() { return p->healthy(); }
 
 std::shared_ptr<KvInner> KvInner::open(const std::string& addr, int inst,
                                        size_t cache_entries, int64_t cache_ttl_ms) {
