@@ -51,9 +51,11 @@ struct Tail {
 
 struct Inner;
 struct KvInner;
+struct RocksInner;
 class Store {
     std::shared_ptr<Inner> in;
-    std::shared_ptr<KvInner> kvin; // set when STORE=dragonfly|redis
+    std::shared_ptr<KvInner> kvin;   // set when STORE=dragonfly|redis
+    std::shared_ptr<RocksInner> rkin; // set when STORE=rocksdb
 
 public:
     /// dir ":memory:" disables persistence. instance < 0 auto-claims.
@@ -62,8 +64,12 @@ public:
     /// the local hot FIFO; cache_ttl_ms bounds cross-node staleness.
     static Store open_kv(const std::string& addr, int instance,
                          size_t cache_entries, int64_t cache_ttl_ms);
-    /// STORE env dispatch: aof|local (default) | dragonfly|redis|kv.
-    /// DRAGONFLY_ADDR/KV_ADDR, CACHE, CACHE_TTL_MS.
+    /// Embedded RocksDB backend. ROCKSDB_PATH (default {dir}/rocks).
+    /// Single-writer: the DB dir is exclusively locked by one process.
+    static Store open_rocks(const std::string& dir, int instance,
+                            size_t cache_entries, int64_t cache_ttl_ms);
+    /// STORE env dispatch: aof|local (default) | dragonfly|redis|kv | rocksdb.
+    /// DRAGONFLY_ADDR/KV_ADDR, ROCKSDB_PATH, CACHE, CACHE_TTL_MS.
     static Store open_env(const std::string& dir, int instance);
 
     int instance() const;

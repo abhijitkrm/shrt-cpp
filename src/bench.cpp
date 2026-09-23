@@ -362,6 +362,22 @@ int main() {
         stop_server(srv);
     }
 
+    // --- rocksdb backend, single instance ---
+    {
+        Env e = env_for("rocks1", {{"SERVER", "mini"},
+                                   {"STORE", "rocksdb"},
+                                   {"SEED", std::to_string(keyspace)}});
+        pid_t srv = start_server(e, bin);
+        auto codes = make_codes(port, 100);
+        std::vector<std::string> reqs;
+        for (auto& c : codes) reqs.push_back(get_req("/" + c));
+        report("redirect (rocksdb)", blast(port, conns, reqs, 1, dur), 1.0);
+        report("redirect (rocksdb, p10)", blast(port, conns, reqs, 10, dur), 1.0);
+        report("shorten (rocksdb)", blast(port, conns, {write_req}, 1, dur), 1.0);
+        report("bulk x1000 (rocksdb)", blast(port, conns / 4, {bulk_req}, 1, dur), BULK_N);
+        stop_server(srv);
+    }
+
     // --- kq comparison ---
     {
         Env e = env_for("kq1", {{"SERVER", "kq"}, {"SEED", std::to_string(keyspace)}});

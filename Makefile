@@ -1,6 +1,7 @@
 CXX      ?= clang++
-CXXFLAGS ?= -std=c++20 -O3 -march=native -flto -Wall -Wextra -Wno-unused-parameter
-LDFLAGS  ?= -flto -pthread
+ROCKSDB_PREFIX ?= /opt/homebrew/opt/rocksdb
+CXXFLAGS ?= -std=c++20 -O3 -march=native -flto -Wall -Wextra -Wno-unused-parameter -I$(ROCKSDB_PREFIX)/include
+LDFLAGS  ?= -flto -pthread -L$(ROCKSDB_PREFIX)/lib -lrocksdb
 
 SRC := $(wildcard src/*.cpp)
 OBJ := $(patsubst src/%.cpp,build/%.o,$(SRC))
@@ -19,7 +20,7 @@ build/%.o: src/%.cpp src/%.hpp src/common.hpp | build
 build/%.o: src/%.cpp src/common.hpp | build
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-build/%.o: tests/%.cpp | build
+build/%.o: tests/%.cpp src/*.hpp src/common.hpp | build
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BIN_SHRT): $(LIB_OBJ) build/main.o

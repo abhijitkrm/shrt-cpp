@@ -54,7 +54,9 @@ SERVER=kq ./shrt    # kqueue evented frontend
 ## Config (env)
 
 `PORT` (3000) · `DATA_DIR` (`data`) · `WORKERS` (1) · `SERVER` (`mini`|`kq`)
-· `STORE` (`aof`|`dragonfly`|`redis`) · `DRAGONFLY_ADDR` (`127.0.0.1:6379`)
+· `STORE` (`aof`|`dragonfly`|`redis`|`rocksdb`) · `DRAGONFLY_ADDR` (`127.0.0.1:6379`)
+· `ROCKSDB_PATH` (`{DATA_DIR}/rocks`) — embedded RocksDB dir (needs
+  `-lrocksdb`; `ROCKSDB_PREFIX` Makefile var points at the brew install)
 · `CACHE` (100000, bounded hot FIFO entries) · `CACHE_TTL_MS` (5000)
 · `KV_LAYOUT` (`key`|`hash`) — `hash` packs links as hash fields in
 `l:{code % KV_BUCKETS}` (~40% less KV memory at ~105B values); expiry via
@@ -69,6 +71,18 @@ self-evicts TTLs), `h:{code}` → hit counter (batched `INCRBY` every 5 ms).
 Each node keeps only a bounded FIFO cache — memory stays flat as links
 grow; a cold redirect costs one `GET`. No tailing — admin mutations work on
 any node. Live tests: `SHRT_KV_ADDR=127.0.0.1:6379 ./shrt-test`.
+
+`STORE=rocksdb` keeps the corpus on local disk in an embedded RocksDB
+(`links` CF: `code` → `{exp}|{created}|{url}`; `hits` CF: u64 counters
+accumulated by a merge operator — no read-modify-write). Expiry is
+enforced on read and a compaction filter drops expired keys during
+compaction — no janitor. Reads hit a bounded in-process FIFO cache first,
+so the DB only sees misses; bloom filters make 404s free. Writes land via
+`WriteBatch` (bulk = one batch). Measured ~210k redirects/s, ~78k
+shortens/s, ~714k bulk rows/s — reads at parity with the in-RAM backend
+since the cache absorbs the hot set. Single-writer: RocksDB holds an
+exclusive LOCK on the dir, so one process per `ROCKSDB_PATH` — for
+multi-instance/multi-node use the `dragonfly`/`redis` backend.
 
 ## Bench
 
