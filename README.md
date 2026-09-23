@@ -56,6 +56,10 @@ SERVER=kq ./shrt    # kqueue evented frontend
 `PORT` (3000) · `DATA_DIR` (`data`) · `WORKERS` (1) · `SERVER` (`mini`|`kq`)
 · `STORE` (`aof`|`dragonfly`|`redis`) · `DRAGONFLY_ADDR` (`127.0.0.1:6379`)
 · `CACHE` (100000, bounded hot FIFO entries) · `CACHE_TTL_MS` (5000)
+· `KV_LAYOUT` (`key`|`hash`) — `hash` packs links as hash fields in
+`l:{code % KV_BUCKETS}` (~40% less KV memory at ~105B values); expiry via
+value check + janitor `KV_SWEEP_MS` (1h). Needs server
+`hash-max-listpack-value` >= value size (~256) for full savings
 · `SEED` (pre-generate N links at boot) · `ADMIN_TOKEN` · `CORS_ORIGIN` (`*`)
 · `LINK_TTL_MS` (86400000, capped at this value)
 

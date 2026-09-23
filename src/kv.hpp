@@ -50,6 +50,12 @@ public:
     std::vector<Resp> pipe(const std::vector<std::vector<std::string>>& cmds);
 
     std::optional<std::string> get(const std::string& k);
+    std::optional<std::string> hget(const std::string& k, const std::string& f);
+    bool hsetnx(const std::string& k, const std::string& f, const std::string& v);
+    bool hset(const std::string& k, const std::string& f, const std::string& v);
+    int64_t hdel(const std::string& k, const std::string& f);
+    void hincrby_many(const std::vector<std::tuple<std::string, std::string, int64_t>>& deltas);
+    void hscan_each(const std::string& k, const std::function<void(std::string, std::string)>& cb);
     bool set(const std::string& k, const std::string& v, int64_t px_ms, bool nx);
     int64_t del(const std::string& k);
     void incrby_many(const std::vector<std::pair<std::string, int64_t>>& deltas);

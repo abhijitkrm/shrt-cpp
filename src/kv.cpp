@@ -209,6 +209,43 @@ void Kv::scan_each(const std::string& pat, const std::function<void(std::string)
     }
 }
 
+std::optional<std::string> Kv::hget(const std::string& k, const std::string& f) {
+    Resp r = cmd({"HGET", k, f});
+    if (r.kind == '$' && !r.null()) return r.str;
+    return std::nullopt;
+}
+bool Kv::hsetnx(const std::string& k, const std::string& f, const std::string& v) {
+    Resp r = cmd({"HSETNX", k, f, v});
+    return r.kind == ':' && r.num == 1;
+}
+bool Kv::hset(const std::string& k, const std::string& f, const std::string& v) {
+    Resp r = cmd({"HSET", k, f, v});
+    return r.kind == ':';
+}
+int64_t Kv::hdel(const std::string& k, const std::string& f) {
+    Resp r = cmd({"HDEL", k, f});
+    return r.kind == ':' ? r.num : 0;
+}
+void Kv::hincrby_many(const std::vector<std::tuple<std::string, std::string, int64_t>>& deltas) {
+    if (deltas.empty()) return;
+    std::vector<std::vector<std::string>> cmds;
+    cmds.reserve(deltas.size());
+    for (auto& [k, f, n] : deltas)
+        cmds.push_back({"HINCRBY", k, f, std::to_string(n)});
+    pipe(cmds);
+}
+void Kv::hscan_each(const std::string& k, const std::function<void(std::string, std::string)>& cb) {
+    std::string cursor = "0";
+    do {
+        Resp r = cmd({"HSCAN", k, cursor, "COUNT", "1000"});
+        if (r.kind != '*' || r.arr.size() != 2) return;
+        cursor = r.arr[0].str;
+        auto& items = r.arr[1].arr;
+        for (size_t i = 0; i + 1 < items.size(); i += 2)
+            cb(items[i].str, items[i + 1].str);
+    } while (cursor != "0");
+}
+
 void Kv::flushdb() { (void)cmd({"FLUSHDB"}); }
 
 } // namespace shrt

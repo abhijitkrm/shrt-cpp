@@ -45,8 +45,11 @@ struct KvInnerImpl {
     std::array<std::unordered_map<std::string, int64_t>, KV_SHARDS> dirty;
     int instance = 0;
     char prefix = '0';
+    bool layout_hash = false;   // KV_LAYOUT=hash: fields in l:{shard%buckets} hashes
+    uint32_t buckets = 1000000; // KV_BUCKETS — keep fields/bucket < hash-max-listpack-entries
     std::atomic<bool> stop{false};
     std::thread flusher;
+    std::thread janitor;
     std::mt19937_64 rng{std::random_device{}()};
 
     KvInnerImpl(const std::string& addr, int inst, size_t cache_entries, int64_t cttl)
@@ -55,16 +58,38 @@ struct KvInnerImpl {
           cache_ttl_ms(cttl),
           instance(std::clamp(inst, 0, 61)) {
         prefix = ALPHABET[instance];
+        if (const char* v = std::getenv("KV_LAYOUT"))
+            layout_hash = std::string(v) == "hash";
+        if (const char* v = std::getenv("KV_BUCKETS"))
+            buckets = (uint32_t)std::max<uint64_t>(1, std::stoull(v));
         flusher = std::thread([this] {
             while (!stop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 try { flush_hits(); } catch (...) {}
             }
         });
+        if (layout_hash) {
+            uint64_t sweep_ms = 3600000;
+            if (const char* v = std::getenv("KV_SWEEP_MS"))
+                sweep_ms = std::max<uint64_t>(50, std::stoull(v));
+            janitor = std::thread([this, sweep_ms] {
+                // slice-sleep so shutdown doesn't block on a full interval
+                uint64_t waited = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    waited += 50;
+                    if (waited >= sweep_ms) {
+                        waited = 0;
+                        try { sweep_expired(); } catch (...) {}
+                    }
+                }
+            });
+        }
     }
     ~KvInnerImpl() {
         stop.store(true);
         if (flusher.joinable()) flusher.join();
+        if (janitor.joinable()) janitor.join();
         try { flush_hits(); } catch (...) {}
     }
 
@@ -76,6 +101,11 @@ struct KvInnerImpl {
 
     static std::string lkey(const std::string& c) { return "l:" + c; }
     static std::string hkey(const std::string& c) { return "h:" + c; }
+    // hash mode: bucket = l:{shard(code) % buckets}, hit field = "h:"+code
+    std::string bkey(const std::string& c) const {
+        return "l:" + std::to_string((uint32_t)shard(c) % buckets);
+    }
+    static std::string hfield(const std::string& c) { return "h:" + c; }
 
     // "{e}|{c}|{u}" — legacy "{e}|{u}" decodes with c=0
     static std::string enc(int64_t e, int64_t c, const std::string& u) {
@@ -99,14 +129,49 @@ struct KvInnerImpl {
     }
 
     void flush_hits() {
-        std::vector<std::pair<std::string, int64_t>> deltas;
-        for (int i = 0; i < KV_SHARDS; i++) {
-            std::lock_guard<std::mutex> g(dirty_mu[i]);
-            for (auto& [code, n] : dirty[i])
-                deltas.emplace_back("h:" + code, n);
-            dirty[i].clear();
+        if (layout_hash) {
+            std::vector<std::tuple<std::string, std::string, int64_t>> deltas;
+            for (int i = 0; i < KV_SHARDS; i++) {
+                std::lock_guard<std::mutex> g(dirty_mu[i]);
+                for (auto& [code, n] : dirty[i])
+                    deltas.emplace_back(bkey(code), hfield(code), n);
+                dirty[i].clear();
+            }
+            kv.hincrby_many(deltas);
+        } else {
+            std::vector<std::pair<std::string, int64_t>> deltas;
+            for (int i = 0; i < KV_SHARDS; i++) {
+                std::lock_guard<std::mutex> g(dirty_mu[i]);
+                for (auto& [code, n] : dirty[i])
+                    deltas.emplace_back("h:" + code, n);
+                dirty[i].clear();
+            }
+            kv.incrby_many(deltas);
         }
-        kv.incrby_many(deltas);
+    }
+
+    // hash-mode janitor: HSCAN each l:* bucket, HDEL expired fields
+    void sweep_expired() {
+        std::vector<std::string> buckets_list;
+        kv.scan_each("l:*", [&](std::string k) { buckets_list.push_back(std::move(k)); });
+        int64_t now = now_ms();
+        std::vector<std::vector<std::string>> dels;
+        for (auto& b : buckets_list) {
+            std::vector<std::string> dead;
+            kv.hscan_each(b, [&](std::string f, std::string v) {
+                if (f.rfind("h:", 0) == 0) return;
+                int64_t e, c;
+                std::string_view u;
+                if (dec(v, e, c, u) && e != 0 && e <= now) dead.push_back(f);
+            });
+            for (auto& f : dead) dels.push_back({"HDEL", b, f});
+        }
+        if (!dels.empty()) kv.pipe(dels);
+    }
+
+    std::optional<std::string> kv_get(const std::string& code) {
+        if (layout_hash) return kv.hget(bkey(code), code);
+        return kv.get(lkey(code));
     }
 
     void bump(const std::string& code) {
@@ -167,7 +232,7 @@ struct KvInnerImpl {
             bump(code);
             return u;
         }
-        auto v = kv.get(lkey(code));
+        auto v = kv_get(code);
         if (!v) return nullptr;
         int64_t e, c;
         std::string_view us;
@@ -183,15 +248,19 @@ struct KvInnerImpl {
         int64_t now = now_ms();
         int64_t exp = ttl_ms > 0 ? now + ttl_ms : 0;
         if (alias) {
-            if (kv.set(lkey(*alias), enc(exp, now, url), ttl_ms, true))
-                return std::make_shared<std::string>(*alias);
+            bool ok = layout_hash
+                ? kv.hsetnx(bkey(*alias), *alias, enc(exp, now, url))
+                : kv.set(lkey(*alias), enc(exp, now, url), ttl_ms, true);
+            if (ok) return std::make_shared<std::string>(*alias);
             return nullptr;
         }
         for (;;) {
             std::string c = gen_code();
             try {
-                if (kv.set(lkey(c), enc(exp, now, url), ttl_ms, true))
-                    return std::make_shared<std::string>(std::move(c));
+                bool ok = layout_hash
+                    ? kv.hsetnx(bkey(c), c, enc(exp, now, url))
+                    : kv.set(lkey(c), enc(exp, now, url), ttl_ms, true);
+                if (ok) return std::make_shared<std::string>(std::move(c));
             } catch (...) {
                 return nullptr;
             }
@@ -207,16 +276,22 @@ struct KvInnerImpl {
         cmds.reserve(urls.size());
         for (size_t i = 0; i < urls.size(); i++) {
             codes[i] = gen_code();
-            std::vector<std::string> args{"SET", lkey(codes[i]), enc(exp, now, urls[i])};
-            if (ttl_ms > 0) { args.emplace_back("PX"); args.push_back(std::to_string(ttl_ms)); }
-            args.emplace_back("NX");
-            cmds.push_back(std::move(args));
+            if (layout_hash) {
+                cmds.push_back({"HSETNX", bkey(codes[i]), codes[i], enc(exp, now, urls[i])});
+            } else {
+                std::vector<std::string> args{"SET", lkey(codes[i]), enc(exp, now, urls[i])};
+                if (ttl_ms > 0) { args.emplace_back("PX"); args.push_back(std::to_string(ttl_ms)); }
+                args.emplace_back("NX");
+                cmds.push_back(std::move(args));
+            }
         }
         std::vector<Resp> rs;
         try { rs = kv.pipe(cmds); }
         catch (...) { rs.clear(); }
         for (size_t i = 0; i < urls.size(); i++) {
-            bool ok = i < rs.size() && rs[i].kind == '+' && rs[i].str == "OK";
+            bool ok = layout_hash
+                ? (i < rs.size() && rs[i].kind == ':' && rs[i].num == 1)
+                : (i < rs.size() && rs[i].kind == '+' && rs[i].str == "OK");
             if (!ok) {
                 auto c2 = shorten(urls[i], nullptr, ttl_ms);
                 if (c2) codes[i] = *c2;
@@ -227,22 +302,30 @@ struct KvInnerImpl {
 
     MutResult update(const std::string& code, const std::string& url,
                      int64_t ttl_ms, bool has_ttl) {
-        auto v = kv.get(lkey(code));
+        auto v = kv_get(code);
         if (!v) return MutResult::Missing;
         int64_t e, c;
         std::string_view us;
         if (!dec(*v, e, c, us)) return MutResult::Missing;
         int64_t exp = has_ttl ? (ttl_ms > 0 ? now_ms() + ttl_ms : 0) : e;
-        int64_t px = exp > 0 ? exp - now_ms() : 0;
-        bool ok = kv.set(lkey(code), enc(exp, c, url), px, false);
+        bool ok = layout_hash
+            ? kv.hset(bkey(code), code, enc(exp, c, url))
+            : kv.set(lkey(code), enc(exp, c, url),
+                     exp > 0 ? exp - now_ms() : 0, false);
         if (!ok) return MutResult::Missing;
         cache_del(code);
         return MutResult::Ok;
     }
 
     MutResult remove(const std::string& code) {
-        if (kv.del(lkey(code)) <= 0) return MutResult::Missing;
-        kv.del(hkey(code));
+        if (layout_hash) {
+            std::string b = bkey(code);
+            if (kv.hdel(b, code) <= 0) return MutResult::Missing;
+            kv.hdel(b, hfield(code));
+        } else {
+            if (kv.del(lkey(code)) <= 0) return MutResult::Missing;
+            kv.del(hkey(code));
+        }
         cache_del(code);
         return MutResult::Ok;
     }
@@ -250,6 +333,39 @@ struct KvInnerImpl {
     std::pair<std::vector<Link>, size_t> list(size_t limit, size_t offset,
                                               const std::string& sort,
                                               const std::string& q) {
+        std::vector<Link> items;
+        int64_t now = now_ms();
+        if (layout_hash) {
+            std::vector<std::string> buckets_list;
+            kv.scan_each("l:*", [&](std::string k) { buckets_list.push_back(std::move(k)); });
+            std::unordered_map<std::string, int64_t> hits;
+            for (auto& b : buckets_list) {
+                kv.hscan_each(b, [&](std::string f, std::string v) {
+                    if (f.rfind("h:", 0) == 0) {
+                        try { hits[f.substr(2)] = std::stoll(v); } catch (...) {}
+                        return;
+                    }
+                    int64_t e, c;
+                    std::string_view u;
+                    if (!dec(v, e, c, u)) return;
+                    if (e != 0 && e <= now) return;
+                    if (!q.empty() && f.find(q) == std::string::npos &&
+                        std::string(u).find(q) == std::string::npos)
+                        return;
+                    Link l;
+                    l.code = f;
+                    l.url = std::string(u);
+                    l.hits = 0;
+                    l.created_at = c;
+                    l.expires_at = e;
+                    items.push_back(std::move(l));
+                });
+            }
+            for (auto& l : items) {
+                auto it = hits.find(l.code);
+                if (it != hits.end()) l.hits = it->second;
+            }
+        } else {
         std::vector<std::string> keys;
         kv.scan_each("l:*", [&](std::string k) { keys.push_back(std::move(k)); });
         std::vector<std::vector<std::string>> cmds;
@@ -260,13 +376,13 @@ struct KvInnerImpl {
         }
         std::vector<Resp> rs;
         try { rs = kv.pipe(cmds); } catch (...) { rs.clear(); }
-        std::vector<Link> items;
         for (size_t i = 0; i < keys.size(); i++) {
             std::string code = keys[i].substr(2);
             if (2 * i >= rs.size() || rs[2 * i].null()) continue;
             int64_t e, c;
             std::string_view u;
             if (!dec(rs[2 * i].str, e, c, u)) continue;
+            if (e != 0 && e <= now) continue;
             std::string us(u);
             if (!q.empty() && code.find(q) == std::string::npos &&
                 us.find(q) == std::string::npos)
@@ -283,6 +399,7 @@ struct KvInnerImpl {
             l.expires_at = e;
             items.push_back(std::move(l));
         }
+        }
         if (sort == "hits")
             std::sort(items.begin(), items.end(),
                       [](const Link& a, const Link& b) { return a.hits > b.hits; });
@@ -293,7 +410,12 @@ struct KvInnerImpl {
     }
 
     std::unique_ptr<Link> stats(const std::string& code) {
-        auto v = kv.get(lkey(code));
+        std::optional<std::string> hv;
+        auto v = kv_get(code);
+        if (layout_hash)
+            hv = kv.hget(bkey(code), hfield(code));
+        else
+            hv = kv.get(hkey(code));
         if (!v) return nullptr;
         int64_t e, c;
         std::string_view u;
@@ -303,7 +425,7 @@ struct KvInnerImpl {
         l->url = std::string(u);
         l->created_at = c;
         l->expires_at = e;
-        if (auto hv = kv.get(hkey(code))) {
+        if (hv) {
             try { l->hits = std::stoll(*hv); } catch (...) {}
         }
         int i = shard(code);
